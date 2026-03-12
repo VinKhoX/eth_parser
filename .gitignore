@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Simulation build and waveform outputs
+sim_build/
+tests/sim_build/
+*.fst
+*.vcd
+*.ghw
+*.result.xml
