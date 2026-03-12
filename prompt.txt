@@ -1,0 +1,10 @@
+"
+Complete the eth parser module implementation in sources/eth_parser.sv 
+
+The main goal is to parse only vlan ethernet frames, you should drop non-vlan frames, vlan mismatch frames, crc error frames. 
+
+you need also demux the payload based on vlan id to either fifo 0 or fifo 1.
+
+Maintain the status of dropped packet, crc error packet, valid packets etc. Create CRC adn paylaod extractor as two submodules and integrate in top file eth_parser.sv 
+
+"

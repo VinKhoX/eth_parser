@@ -371,7 +371,7 @@ def test_eth_parser_runner():
     sim       = os.getenv("SIM", "icarus")
     test_dir  = Path(__file__).resolve().parent
     proj_path = test_dir.parent
-    src_dir   = proj_path / "golden"
+    src_dir   = proj_path / "sources"
 
     sources  = [
         src_dir / "crc32.v",
