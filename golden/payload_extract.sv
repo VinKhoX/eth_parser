@@ -1,313 +1,136 @@
 // =============================================================================
-// Module  : payload_extract
-// Purpose : Parse Ethernet frames, filter by 802.1Q VLAN-ID (0 or 1),
-//           validate CRC-32, then replay buffered payload to the FIFO port
-//           that corresponds to the packet's VLAN-ID.
-//
-// Frame layout (bytes on wire):
-//   [6B DA][6B SA][2B TPID=0x8100][2B TCI][2B inner-EType][N B Payload][4B FCS]
-//   Non-VLAN frames and VLAN-ID > 1 are silently dropped.
-//
-// fifo_wen encoding (post-CRC, during S_REPLAY only):
-//   fifo_wen[0] = 1  →  payload byte belongs to VLAN-ID 0
-//   fifo_wen[1] = 1  →  payload byte belongs to VLAN-ID 1
-//
-// External CRC32 interface:
-//   crc_init  (wire out) – pulse high at SOP to reset crc32 accumulator
-//   crc_data  (reg  out) – byte being hashed (DA through end-of-payload)
-//   crc_vld   (reg  out) – qualifies crc_data
-//   crc_computed (in)   – residue from crc32 module (compare at S_CRC)
+// Simplified payload_extract: 802.1Q parsing, no CRC. Valid / invalid counts only.
+// Frame: [6B DA][6B SA][2B TPID][2B TCI][2B EtherType][N payload][4B FCS]
+// Valid = TPID 0x8100, VID 0 or 1, frame_len >= 22, no rx_err.
+// Invalid = truncated, rx_err, or non-VLAN (TPID != 0x8100). VID > 1 = silent drop.
 // =============================================================================
 
 module payload_extract #(
-    parameter MAX_PKT = 2048   // internal payload buffer depth (bytes)
+    parameter MAX_PKT = 2048
 )(
     input  wire        clk,
     input  wire        rst,
 
-    // RX byte stream
     input  wire        rx_valid,
     input  wire [7:0]  rx_data,
     input  wire        rx_err,
 
-    // External CRC32 sidecar
-    output wire        crc_init,        // = SOP (wire, not registered)
-    output reg  [7:0]  crc_data,
-    output reg         crc_vld,
-    input  wire [31:0] crc_computed,
-
-    // VLAN-demux FIFO write interface (valid only during S_REPLAY)
     output reg  [1:0]  fifo_wen,
     output reg  [7:0]  raw_payload,
 
-    // Statistics counters
-    output reg  [15:0] crc_err_cnt,
-    output reg  [15:0] pkt_err_cnt,
-    output reg  [15:0] vlan_err_cnt,
-    output reg  [15:0] valid_pkt_cnt
+    output reg  [15:0] valid_pkt_cnt,
+    output reg  [15:0] invalid_pkt_cnt
 );
 
-// ---------------------------------------------------------------------------
-// FSM states
-// ---------------------------------------------------------------------------
-localparam [2:0]
-    S_IDLE   = 3'd0,
-    S_HEADER = 3'd1,
-    S_ETYPE  = 3'd2,
-    S_VLAN   = 3'd3,
-    S_DATA   = 3'd4,
-    S_CRC    = 3'd5,
-    S_REPLAY = 3'd6,
-    S_DROP   = 3'd7;
+    localparam [2:0] S_IDLE   = 3'd0,
+                     S_RECV   = 3'd1,
+                     S_REPLAY = 3'd2,
+                     S_DROP   = 3'd3;
 
-// ---------------------------------------------------------------------------
-// Input pipeline (SOP/EOP detection)
-// ---------------------------------------------------------------------------
-reg rx_valid_d1;
-always @(posedge clk) rx_valid_d1 <= rst ? 1'b0 : rx_valid;
+    reg [2:0]  state, next_state;
+    reg        rx_valid_d1;
+    wire       sop = rx_valid & ~rx_valid_d1;
+    wire       eop = ~rx_valid & rx_valid_d1;
 
-wire sop_wire = rx_valid  & ~rx_valid_d1;
-wire eop_wire = ~rx_valid &  rx_valid_d1;
+    wire       is_valid_eop = (tpid == 16'h8100) & (vlan_id <= 12'd1) & (byte_cnt >= 12'd22) & ~err_latch;
+    wire       is_silent_drop = (tpid == 16'h8100) & (vlan_id > 12'd1) & (byte_cnt >= 12'd22) & ~err_latch;
 
-assign crc_init = sop_wire;   // combinational – crc32 resets at SOP edge
+    reg [11:0] byte_cnt;       // byte index in frame
+    reg [15:0] tpid;
+    reg [11:0] vlan_id;
+    reg        err_latch;      // rx_err seen this frame
+    reg        silent_drop;    // drop due to VID>1 only; do not increment invalid
+    reg        is_valid;       // 1 = accept (VLAN 0/1, long enough), 0 = invalid
 
-// ---------------------------------------------------------------------------
-// Internal registers
-// ---------------------------------------------------------------------------
-reg [2:0]  fsm_state;
-reg [4:0]  byte_cnt;
-reg [4:0]  data_byte_cnt;   // saturates at 4 in S_DATA
+    reg [7:0]  pkt_buf [0:MAX_PKT-1];
+    reg [11:0] buf_wr_ptr, buf_rd_ptr, payload_len;
+    localparam PAYLOAD_START = 12'd18;   // first payload byte index
 
-// EtherType parsing
-reg [7:0]  etype_hi;
+    always @(posedge clk) rx_valid_d1 <= rst ? 1'b0 : rx_valid;
 
-// VLAN
-reg [11:0] vlan_id;          // 12-bit 802.1Q VID
-reg [7:0]  tci_byte0;        // holds first TCI byte until second arrives
-
-// Error / replay control
-reg        pkt_err_latch;
-reg [31:0] rx_crc_captured;
-
-// CRC-strip trailing window (holds last 4 S_DATA bytes = FCS)
-reg [7:0]  trail_buf [0:3];
-
-// Payload buffer
-reg [7:0]  pkt_buf [0:MAX_PKT-1];
-reg [10:0] buf_wr_ptr;
-reg [10:0] buf_rd_ptr;
-
-// ---------------------------------------------------------------------------
-// FSM
-// ---------------------------------------------------------------------------
-always @(posedge clk or posedge rst) begin
-    if (rst) begin
-        fsm_state       <= S_IDLE;
-        byte_cnt        <= 5'd0;
-        data_byte_cnt   <= 5'd0;
-        etype_hi        <= 8'd0;
-        vlan_id         <= 12'd0;
-        tci_byte0       <= 8'd0;
-        pkt_err_latch   <= 1'b0;
-        rx_crc_captured <= 32'd0;
-        buf_wr_ptr      <= 11'd0;
-        buf_rd_ptr      <= 11'd0;
-        trail_buf[0]    <= 8'd0;  trail_buf[1] <= 8'd0;
-        trail_buf[2]    <= 8'd0;  trail_buf[3] <= 8'd0;
-        fifo_wen        <= 2'b00;
-        raw_payload     <= 8'd0;
-        crc_data        <= 8'd0;
-        crc_vld         <= 1'b0;
-        crc_err_cnt     <= 16'd0;
-        pkt_err_cnt     <= 16'd0;
-        vlan_err_cnt    <= 16'd0;
-        valid_pkt_cnt   <= 16'd0;
-    end else begin
-        // Default: suppress outputs
-        fifo_wen    <= 2'b00;
-        raw_payload <= 8'd0;
-        crc_vld     <= 1'b0;
-        crc_data    <= 8'd0;
-
-        if (rx_valid && rx_err)
-            pkt_err_latch <= 1'b1;
-
-        case (fsm_state)
-
-            // ----------------------------------------------------------------
-            S_IDLE: begin
-                byte_cnt      <= 5'd0;
-                data_byte_cnt <= 5'd0;
-                buf_wr_ptr    <= 11'd0;
-                vlan_id       <= 12'd0;
-                pkt_err_latch <= 1'b0;
-                if (sop_wire) begin
-                    // DA[0] – feed to CRC next cycle (registered outputs)
-                    crc_data  <= rx_data;
-                    crc_vld   <= 1'b1;
-                    byte_cnt  <= 5'd1;
-                    fsm_state <= S_HEADER;
-                end
-            end
-
-            // ----------------------------------------------------------------
-            // S_HEADER : bytes 1–11 of DA+SA (byte 0 consumed in S_IDLE)
-            // ----------------------------------------------------------------
-            S_HEADER: begin
-                if (eop_wire) begin
-                    pkt_err_cnt <= pkt_err_cnt + 1'b1;
-                    fsm_state   <= S_IDLE;
-                end else if (rx_valid) begin
-                    crc_data  <= rx_data;
-                    crc_vld   <= 1'b1;
-                    byte_cnt  <= byte_cnt + 1'b1;
-                    if (byte_cnt == 5'd11) begin
-                        fsm_state <= S_ETYPE;
-                        byte_cnt  <= 5'd0;
-                    end
-                end
-            end
-
-            // ----------------------------------------------------------------
-            // S_ETYPE : 2-byte EtherType / TPID
-            // ----------------------------------------------------------------
-            S_ETYPE: begin
-                if (eop_wire) begin
-                    pkt_err_cnt <= pkt_err_cnt + 1'b1;
-                    fsm_state   <= S_IDLE;
-                end else if (rx_valid) begin
-                    crc_data <= rx_data;
-                    crc_vld  <= 1'b1;
-                    if (byte_cnt == 5'd0) begin
-                        etype_hi <= rx_data;
-                        byte_cnt <= 5'd1;
-                    end else begin
-                        byte_cnt <= 5'd0;
-                        if (etype_hi == 8'h81 && rx_data == 8'h00)
-                            fsm_state <= S_VLAN;       // 802.1Q tag detected
-                        else begin
-                            crc_vld   <= 1'b0;
-                            fsm_state <= S_DROP;        // non-VLAN → drop
-                        end
-                    end
-                end
-            end
-
-            // ----------------------------------------------------------------
-            // S_VLAN : 4-byte 802.1Q tag (TCI[2B] + inner-EType[2B])
-            //   byte 0 → tci_byte0  (PCP/DEI/VID[11:8])
-            //   byte 1 → VID[7:0]   → full VID captured
-            //   bytes 2-3 → inner EtherType (fed to CRC, ignored for demux)
-            // ----------------------------------------------------------------
-            S_VLAN: begin
-                if (eop_wire) begin
-                    vlan_err_cnt <= vlan_err_cnt + 1'b1;
-                    pkt_err_cnt  <= pkt_err_cnt  + 1'b1;
-                    fsm_state    <= S_IDLE;
-                end else if (rx_valid) begin
-                    crc_data  <= rx_data;
-                    crc_vld   <= 1'b1;
-                    byte_cnt  <= byte_cnt + 1'b1;
-
-                    case (byte_cnt)
-                        5'd0: tci_byte0 <= rx_data;
-                        5'd1: vlan_id   <= {tci_byte0[3:0], rx_data};
-                        default: ;
-                    endcase
-
-                    if (byte_cnt == 5'd3) begin
-                        byte_cnt <= 5'd0;
-                        // Only forward VID 0 or 1; drop everything else
-                        if (vlan_id[11:1] == 11'd0)
-                            fsm_state <= S_DATA;
-                        else begin
-                            crc_vld   <= 1'b0;
-                            fsm_state <= S_DROP;
-                        end
-                    end
-                end
-            end
-
-            // ----------------------------------------------------------------
-            // S_DATA : payload + 4-byte FCS trailing window
-            //   confirmed payload bytes → pkt_buf + crc feed
-            // ----------------------------------------------------------------
-            S_DATA: begin
-                if (rx_valid) begin
-                    trail_buf[0] <= trail_buf[1];
-                    trail_buf[1] <= trail_buf[2];
-                    trail_buf[2] <= trail_buf[3];
-                    trail_buf[3] <= rx_data;
-
-                    if (data_byte_cnt < 5'd4)
-                        data_byte_cnt <= data_byte_cnt + 1'b1;
-
-                    if (data_byte_cnt >= 5'd4) begin
-                        // trail_buf[0] is a confirmed payload byte
-                        crc_data  <= trail_buf[0];
-                        crc_vld   <= 1'b1;
-                        if (buf_wr_ptr < MAX_PKT) begin
-                            pkt_buf[buf_wr_ptr] <= trail_buf[0];
-                            buf_wr_ptr          <= buf_wr_ptr + 1'b1;
-                        end
-                    end
-                end
-
-                if (eop_wire) begin
-                    // trail_buf holds the received FCS; capture it
-                    rx_crc_captured <= {trail_buf[0], trail_buf[1],
-                                        trail_buf[2], trail_buf[3]};
-                    data_byte_cnt   <= 5'd0;
-                    fsm_state       <= S_CRC;
-                end
-            end
-
-            // ----------------------------------------------------------------
-            // S_CRC : validate FCS. If good → S_REPLAY, else → S_IDLE.
-            // ----------------------------------------------------------------
-            S_CRC: begin
-                if (pkt_err_latch) begin
-                    pkt_err_cnt   <= pkt_err_cnt + 1'b1;
-                    pkt_err_latch <= 1'b0;
-                    fsm_state     <= S_IDLE;
-                end else if (rx_crc_captured != crc_computed) begin
-                    crc_err_cnt <= crc_err_cnt + 1'b1;
-                    fsm_state   <= S_IDLE;
-                end else begin
-                    valid_pkt_cnt <= valid_pkt_cnt + 1'b1;
-                    buf_rd_ptr    <= 11'd0;
-                    fsm_state     <= S_REPLAY;
-                end
-            end
-
-            // ----------------------------------------------------------------
-            // S_REPLAY : stream pkt_buf to the correct VLAN FIFO port.
-            // ----------------------------------------------------------------
-            S_REPLAY: begin
-                if (buf_rd_ptr < buf_wr_ptr) begin
-                    raw_payload           <= pkt_buf[buf_rd_ptr];
-                    fifo_wen[vlan_id[0]]  <= 1'b1;
-                    buf_rd_ptr            <= buf_rd_ptr + 1'b1;
-                end else begin
-                    // All bytes replayed – return to idle
-                    fifo_wen  <= 2'b00;
-                    fsm_state <= S_IDLE;
-                end
-            end
-
-            // ----------------------------------------------------------------
-            // S_DROP : consume frame silently until EOP (no CRC feed)
-            // ----------------------------------------------------------------
-            S_DROP: begin
-                if (eop_wire)
-                    fsm_state <= S_IDLE;
-            end
-
-            default: fsm_state <= S_IDLE;
-
+    // FSM next state
+    always @(*) begin
+        next_state = state;
+        case (state)
+            S_IDLE:   if (sop) next_state = S_RECV;
+            S_RECV:   if (eop) next_state = is_valid_eop ? S_REPLAY : S_DROP;
+            S_REPLAY: if (buf_rd_ptr >= payload_len) next_state = S_IDLE;
+            S_DROP:   next_state = S_IDLE;
+            default:  next_state = S_IDLE;
         endcase
     end
-end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            state           <= S_IDLE;
+            byte_cnt        <= 12'd0;
+            tpid            <= 16'd0;
+            vlan_id         <= 12'd0;
+            err_latch       <= 1'b0;
+            silent_drop     <= 1'b0;
+            is_valid        <= 1'b0;
+            buf_wr_ptr      <= 12'd0;
+            buf_rd_ptr      <= 12'd0;
+            payload_len     <= 12'd0;
+            fifo_wen        <= 2'b00;
+            raw_payload     <= 8'd0;
+            valid_pkt_cnt   <= 16'd0;
+            invalid_pkt_cnt <= 16'd0;
+        end else begin
+            state <= next_state;
+            fifo_wen <= 2'b00;
+
+            if (rx_valid & rx_err)
+                err_latch <= 1'b1;
+
+            case (state)
+                S_IDLE: begin
+                    byte_cnt   <= 12'd0;
+                    buf_wr_ptr <= 12'd0;
+                    err_latch  <= 1'b0;
+                    if (sop) begin
+                        if (12'd0 < MAX_PKT)
+                            pkt_buf[12'd0] <= rx_data;
+                        byte_cnt <= 12'd1;
+                    end
+                end
+
+                S_RECV: begin
+                    if (rx_valid) begin
+                        if (byte_cnt < MAX_PKT)
+                            pkt_buf[byte_cnt] <= rx_data;
+                        case (byte_cnt)
+                            12'd12: tpid[15:8] <= rx_data;  // TPID byte 0
+                            12'd13: tpid[7:0]  <= rx_data;  // TPID byte 1
+                            12'd14: ; // TCI high
+                            12'd15: vlan_id    <= {4'b0, rx_data}; // VID[7:0]
+                            default: ;
+                        endcase
+                        byte_cnt <= byte_cnt + 1'b1;
+                    end
+                    if (eop) begin
+                        is_valid    <= (tpid == 16'h8100) & (vlan_id <= 12'd1) & (byte_cnt >= 12'd22) & ~err_latch;
+                        silent_drop  <= is_silent_drop;
+                        payload_len  <= (byte_cnt >= 12'd22) ? (byte_cnt - 12'd22) : 12'd0;
+                        buf_rd_ptr   <= 12'd0;
+                    end
+                end
+
+                S_REPLAY: begin
+                    if (buf_rd_ptr < payload_len) begin
+                        raw_payload <= pkt_buf[PAYLOAD_START + buf_rd_ptr];
+                        if (vlan_id == 12'd0) fifo_wen[0] <= 1'b1;
+                        else if (vlan_id == 12'd1) fifo_wen[1] <= 1'b1;
+                        buf_rd_ptr  <= buf_rd_ptr + 1'b1;
+                    end else
+                        valid_pkt_cnt <= valid_pkt_cnt + 1'b1;
+                end
+
+                S_DROP: if (!silent_drop) invalid_pkt_cnt <= invalid_pkt_cnt + 1'b1;
+
+                default: ;
+            endcase
+        end
+    end
 
 endmodule
-
