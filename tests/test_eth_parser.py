@@ -81,6 +81,10 @@ def assert_counters(dut, valid=0, invalid=0, msg=""):
 
 REPLAY_SETTLE = len(PAYLOAD) + 10
 
+def build_truncated_vlan_vid0() -> bytes:
+    """802.1Q start but EOP before full header+FCS (17 bytes) — truncated, invalid."""
+    return DA + SA + b'\x81\x00' + struct.pack('>H', 0) + b'\x08'
+
 # ===========================================================================
 # Tests (5 cases: valid VID 0/1, invalid, silent drop, FIFO routing)
 # ===========================================================================
@@ -124,6 +128,25 @@ async def test_vid5_silent_drop(dut):
     await settle(dut, 6)
     assert_counters(dut, msg="vid5 drop")
 
+@cocotb.test()
+async def test_truncated_vlan_invalid(dut):
+    """802.1Q frame too short before EOP → invalid=1."""
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    await do_reset(dut)
+    await drive_frame(dut, build_truncated_vlan_vid0())
+    await settle(dut, 8)
+    assert_counters(dut, invalid=1, msg="truncated vlan")
+
+@cocotb.test()
+async def test_rx_err_invalid(dut):
+    """rx_err asserted during a VLAN frame → invalid=1 (no valid accept)."""
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    await do_reset(dut)
+    frame = append_fcs(build_vlan_frame(0, PAYLOAD))
+    err_at = len(DA) + 3
+    await drive_frame(dut, frame, err_at=err_at)
+    await settle(dut, REPLAY_SETTLE)
+    assert_counters(dut, invalid=1, msg="rx_err")
 
 @cocotb.test()
 async def test_fifo_routing(dut):
@@ -154,7 +177,7 @@ async def test_fifo_routing(dut):
 
 
 # ===========================================================================
-# Runner — builds from golden/
+# Runner. [Vinay changes 17/03]
 # ===========================================================================
 def test_eth_parser_runner():
     sim = os.getenv("SIM", "icarus")
