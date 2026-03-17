@@ -30,5 +30,5 @@ Silent drop (do not change either counter): TPID == 0x8100 and VID is greater th
 
 D) Deliverable
 
-The implementation must pass all tests in tests/test_eth_parser.py.
+The implementation must pass all tests in tests/test_eth_parser.py. Do not modify tests/test_eth_parser.py or any other file under tests/; change only the RTL under sources/.
 "
