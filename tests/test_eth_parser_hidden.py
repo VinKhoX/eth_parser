@@ -195,7 +195,7 @@ def test_eth_parser_runner():
     )
     runner.test(
         hdl_toplevel="eth_parser",
-        test_module="test_eth_parser",
+        test_module="test_eth_parser_hidden",
         plusargs=["+dump_file=eth_parser.fst"],
     )
 
